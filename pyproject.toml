@@ -26,6 +26,8 @@ dependencies = [
     "setuptools<81",
     "pyyaml>=6.0.3",
     "logfire",
+    "transformers>=4.45.2",
+    "sentencepiece>=0.2.1",
 ]
 
 [dependency-groups]
