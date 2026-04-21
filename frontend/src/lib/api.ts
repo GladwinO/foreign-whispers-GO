@@ -70,6 +70,12 @@ export async function stitchVideo(
   );
 }
 
+export async function diarizeVideo(videoId: string): Promise<DiarizeResponse> {
+  return fetchJson<DiarizeResponse>(`/api/diarize/${videoId}`, {
+    method: "POST",
+  });
+}
+
 export function getVideoUrl(videoId: string, config: string): string {
   return `/api/video/${videoId}?config=${config}`;
 }
