@@ -57,8 +57,31 @@ async def tts_endpoint(
 
     source_path = str(trans_dir / f"{title}.json")
 
+    # Build per-speaker voice mapping from pipeline_data/speakers/{lang}/
+    lang = "es"
+    lang_dir = settings.data_dir.parent / "speakers" / lang
+    speaker_wav_map: dict[str, str] = {}
+    if lang_dir.exists():
+        wavs = sorted(lang_dir.glob("*.wav"))
+        if wavs:
+            # Load speaker labels from transcription JSON (set by diarize endpoint)
+            transcript_path = settings.transcriptions_dir / f"{title}.json"
+            if transcript_path.exists():
+                transcript = json.loads(transcript_path.read_text())
+                speakers = sorted({
+                    seg.get("speaker", "")
+                    for seg in transcript.get("segments", [])
+                    if seg.get("speaker")
+                })
+                # Round-robin: assign WAVs by index, wrap around if more speakers than WAVs
+                speaker_wav_map = {
+                    speaker: str(wavs[i % len(wavs)])
+                    for i, speaker in enumerate(speakers)
+                }
+
     await _run_in_threadpool(
-        None, svc.text_file_to_speech, source_path, str(audio_dir), alignment=alignment
+        None, svc.text_file_to_speech, source_path, str(audio_dir),
+        alignment=alignment, speaker_wav_map=speaker_wav_map
     )
 
     return {
