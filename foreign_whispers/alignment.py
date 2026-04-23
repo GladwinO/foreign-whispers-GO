@@ -245,88 +245,206 @@ def compute_segment_metrics(
     return metrics
 
 
-def global_align(
+def global_align_dp(
     metrics:         list[SegmentMetrics],
     silence_regions: list[dict],
     max_stretch:     float = 1.4,
+    speaker_labels:  list[str] | None = None,
+    beam_width:      int = 10,
 ) -> list[AlignedSegment]:
-    """Greedy left-to-right global alignment of dubbed segments.
+    """Hybrid DP/beam-search global alignment optimizer.
 
-    Segments are timed independently by ``decide_action`` (P7), but they are
-    sequential — if segment 5 borrows 0.3s from a silence gap, every segment
-    after it shifts by 0.3s.  This function tracks that cumulative drift.
+    Selects the best algorithm automatically based on problem size:
 
-    Algorithm (single pass, O(n)):
+    - **Greedy fallback** when no gap shifts are available (O(n)).
+    - **Exact DP** when ≤ 50 gap opportunities exist (O(n × gaps),
+      globally optimal penalty minimization).
+    - **Beam search** when > 50 gap opportunities exist (O(n × beam_width),
+      fast approximation for long natural-speech videos).
 
-    1. For each segment, call ``decide_action(m, available_gap_s)`` where
-       *available_gap_s* comes from VAD silence regions after this segment.
-    2. Based on the action:
+    Penalty weights used for optimization::
 
-       - ``GAP_SHIFT`` — the segment expands into the silence after it
-         (``gap_shift = overflow_s``).
-       - ``MILD_STRETCH`` — time-stretch capped at *max_stretch* (default 1.4x).
-       - ``ACCEPT``, ``REQUEST_SHORTER``, ``FAIL`` — no modification.
+        ACCEPT=0, MILD_STRETCH=1, GAP_SHIFT=2, REQUEST_SHORTER=4, FAIL=8
 
-    3. Schedule the segment with cumulative drift applied::
-
-           scheduled_start = original_start + cumulative_drift
-           scheduled_end   = scheduled_start + original_duration + gap_shift
-
-    4. Every ``gap_shift`` adds to *cumulative_drift*, pushing all subsequent
-       segments forward.
-
-    Limitations:
-
-    - **Greedy** — never looks ahead.  If segment 10 has a huge overflow and
-      segment 9 has a large silence gap, it will not save that gap for
-      segment 10.
-    - **No backtracking** — once a decision is made, it is final.
-    - A dynamic-programming or constraint-solver approach would produce
-      better schedules, but this is the baseline to start from.
+    Speaker-boundary constraint: when *speaker_labels* is provided, gap
+    shifts are forbidden across speaker turn boundaries — preventing one
+    speaker's audio from bleeding into another's time window. Labels come
+    from ``assign_speakers()`` in the diarization pipeline.
 
     Args:
         metrics: Per-segment timing metrics from ``compute_segment_metrics``.
-        silence_regions: VAD output — list of ``{"start_s", "end_s", "label"}``
-            dicts.  Pass ``[]`` if VAD is unavailable (gap_shift disabled).
-        max_stretch: Upper bound for ``MILD_STRETCH`` speed factor.
+        silence_regions: VAD output dicts with ``start_s``, ``end_s``, ``label``.
+            Pass ``[]`` if VAD is unavailable (triggers greedy fallback).
+        max_stretch: Upper bound for MILD_STRETCH speed factor.
+        speaker_labels: Optional list of speaker IDs aligned to *metrics*
+            (e.g. ``["SPEAKER_00", "SPEAKER_01", ...]``). Pass ``None`` to
+            disable speaker-boundary constraints.
+        beam_width: Number of trajectories to keep alive in beam search
+            (used only when gap opportunities > 50).
 
     Returns:
         One ``AlignedSegment`` per input metric, in order.
     """
+    _PENALTY = {
+        AlignAction.ACCEPT:          0,
+        AlignAction.MILD_STRETCH:    1,
+        AlignAction.GAP_SHIFT:       2,
+        AlignAction.REQUEST_SHORTER: 4,
+        AlignAction.FAIL:            8,
+    }
+
     def _silence_after(end_s: float) -> float:
         for r in silence_regions:
             if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
                 return r["end_s"] - r["start_s"]
         return 0.0
 
-    aligned, cumulative_drift = [], 0.0
+    def _same_speaker_as_next(i: int) -> bool:
+        """True if gap shift is allowed (same speaker or no labels)."""
+        if speaker_labels is None or i >= len(metrics) - 1:
+            return True
+        s1 = speaker_labels[i] if i < len(speaker_labels) else ""
+        s2 = speaker_labels[i+1] if i+1 < len(speaker_labels) else ""
+        return s1 == s2 or not s1 or not s2
 
-    for m in metrics:
-        action    = decide_action(m, available_gap_s=_silence_after(m.source_end))
-        gap_shift = 0.0
-        stretch   = 1.0
+    # Determine which segments are eligible for gap shifts
+    gap_eligible = [
+        decide_action(m, available_gap_s=_silence_after(m.source_end))
+        == AlignAction.GAP_SHIFT
+        and _same_speaker_as_next(i)
+        for i, m in enumerate(metrics)
+    ]
+    max_shifts = sum(gap_eligible)
 
-        if action == AlignAction.GAP_SHIFT:
-            gap_shift = m.overflow_s
-        elif action == AlignAction.MILD_STRETCH:
-            stretch = min(m.predicted_stretch, max_stretch)
-        # ACCEPT, REQUEST_SHORTER, FAIL → stretch stays at 1.0
+    # ------------------------------------------------------------------ #
+    # Strategy selection
+    # ------------------------------------------------------------------ #
+    if max_shifts == 0:
+        # No gap shifts possible — greedy is already optimal
+        return global_align(metrics, silence_regions, max_stretch)
 
-        sched_start = m.source_start + cumulative_drift
-        sched_end   = sched_start + m.source_duration_s + gap_shift
+    def _build_aligned(use_gap_shift: list[bool]) -> list[AlignedSegment]:
+        """Convert gap-shift decisions into AlignedSegment list."""
+        aligned, drift = [], 0.0
+        for i, m in enumerate(metrics):
+            if use_gap_shift[i]:
+                action    = AlignAction.GAP_SHIFT
+                gap_shift = m.overflow_s
+                stretch   = 1.0
+            else:
+                action    = decide_action(m, available_gap_s=0.0)
+                gap_shift = 0.0
+                stretch   = (
+                    min(m.predicted_stretch, max_stretch)
+                    if action == AlignAction.MILD_STRETCH else 1.0
+                )
+            sched_start = m.source_start + drift
+            sched_end   = sched_start + m.source_duration_s + gap_shift
+            aligned.append(AlignedSegment(
+                index           = m.index,
+                original_start  = m.source_start,
+                original_end    = m.source_end,
+                scheduled_start = sched_start,
+                scheduled_end   = sched_end,
+                text            = m.translated_text,
+                action          = action,
+                gap_shift_s     = gap_shift,
+                stretch_factor  = stretch,
+            ))
+            drift += gap_shift
+        return aligned
 
-        aligned.append(AlignedSegment(
-            index           = m.index,
-            original_start  = m.source_start,
-            original_end    = m.source_end,
-            scheduled_start = sched_start,
-            scheduled_end   = sched_end,
-            text            = m.translated_text,
-            action          = action,
-            gap_shift_s     = gap_shift,
-            stretch_factor  = stretch,
-        ))
+    def _total_penalty(use_gap_shift: list[bool]) -> int:
+        total = 0
+        for i, m in enumerate(metrics):
+            if use_gap_shift[i]:
+                total += _PENALTY[AlignAction.GAP_SHIFT]
+            else:
+                total += _PENALTY[decide_action(m, available_gap_s=0.0)]
+        return total
 
-        cumulative_drift += gap_shift
+    n = len(metrics)
 
-    return aligned
+    if max_shifts <= 50:
+        # ---------------------------------------------------------------- #
+        # Exact DP — globally optimal for moderate gap counts
+        # ---------------------------------------------------------------- #
+        INF = float("inf")
+        # dp[i][b] = min penalty for segments 0..i using b gap-shifts
+        dp     = [[INF] * (max_shifts + 1) for _ in range(n)]
+        choice = [[False] * (max_shifts + 1) for _ in range(n)]
+
+        # Initialise first segment
+        _, p_no = AlignAction.GAP_SHIFT, _PENALTY[decide_action(metrics[0], 0.0)]
+        dp[0][0] = _PENALTY[decide_action(metrics[0], available_gap_s=0.0)]
+        if gap_eligible[0]:
+            dp[0][1] = _PENALTY[AlignAction.GAP_SHIFT]
+            choice[0][1] = True
+
+        for i in range(1, n):
+            pen_no_gap = _PENALTY[decide_action(metrics[i], available_gap_s=0.0)]
+            pen_gap    = _PENALTY[AlignAction.GAP_SHIFT]
+            for b in range(max_shifts + 1):
+                # Option 1: no gap shift
+                cost_no = (dp[i-1][b] + pen_no_gap
+                           if dp[i-1][b] < INF else INF)
+                # Option 2: gap shift (use one slot)
+                cost_gap = INF
+                if b > 0 and gap_eligible[i] and dp[i-1][b-1] < INF:
+                    cost_gap = dp[i-1][b-1] + pen_gap
+
+                if cost_gap < cost_no:
+                    dp[i][b] = cost_gap
+                    choice[i][b] = True
+                else:
+                    dp[i][b] = cost_no
+                    choice[i][b] = False
+
+        # Find optimal b
+        best_b = min(range(max_shifts + 1), key=lambda b: dp[n-1][b])
+
+        # Backtrack
+        use_gap = [False] * n
+        b = best_b
+        for i in range(n - 1, -1, -1):
+            if choice[i][b]:
+                use_gap[i] = True
+                b -= 1
+
+        return _build_aligned(use_gap)
+
+    else:
+        # ---------------------------------------------------------------- #
+        # Beam search — fast approximation for videos with many gaps
+        # ---------------------------------------------------------------- #
+        # State: (cumulative_penalty, shifts_used, gap_decisions_so_far)
+        # Beam keeps the `beam_width` lowest-penalty trajectories alive
+        beam = [(0, 0, [])]  # (penalty, shifts_used, decisions)
+
+        for i, m in enumerate(metrics):
+            candidates = []
+            pen_no_gap = _PENALTY[decide_action(m, available_gap_s=0.0)]
+            pen_gap    = _PENALTY[AlignAction.GAP_SHIFT]
+
+            for pen, shifts, decisions in beam:
+                # Option 1: no gap shift
+                candidates.append((
+                    pen + pen_no_gap,
+                    shifts,
+                    decisions + [False],
+                ))
+                # Option 2: gap shift
+                if gap_eligible[i]:
+                    candidates.append((
+                        pen + pen_gap,
+                        shifts + 1,
+                        decisions + [True],
+                    ))
+
+            # Keep best beam_width trajectories
+            candidates.sort(key=lambda x: x[0])
+            beam = candidates[:beam_width]
+
+        # Best trajectory
+        best_pen, _, best_decisions = beam[0]
+        return _build_aligned(best_decisions)
