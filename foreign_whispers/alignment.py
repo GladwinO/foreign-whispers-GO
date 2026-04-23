@@ -244,6 +244,62 @@ def compute_segment_metrics(
         ))
     return metrics
 
+def global_align(
+    metrics:         list[SegmentMetrics],
+    silence_regions: list[dict],
+    max_stretch:     float = 1.4,
+) -> list[AlignedSegment]:
+    """Greedy left-to-right global alignment of dubbed segments.
+
+    Segments are timed independently by ``decide_action``, but they are
+    sequential — if segment 5 borrows 0.3s from a silence gap, every segment
+    after it shifts by 0.3s.  This function tracks that cumulative drift.
+
+    Args:
+        metrics: Per-segment timing metrics from ``compute_segment_metrics``.
+        silence_regions: VAD output — list of ``{"start_s", "end_s", "label"}``
+            dicts.  Pass ``[]`` if VAD is unavailable (gap_shift disabled).
+        max_stretch: Upper bound for ``MILD_STRETCH`` speed factor.
+
+    Returns:
+        One ``AlignedSegment`` per input metric, in order.
+    """
+    def _silence_after(end_s: float) -> float:
+        for r in silence_regions:
+            if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
+                return r["end_s"] - r["start_s"]
+        return 0.0
+
+    aligned, cumulative_drift = [], 0.0
+
+    for m in metrics:
+        action    = decide_action(m, available_gap_s=_silence_after(m.source_end))
+        gap_shift = 0.0
+        stretch   = 1.0
+
+        if action == AlignAction.GAP_SHIFT:
+            gap_shift = m.overflow_s
+        elif action == AlignAction.MILD_STRETCH:
+            stretch = min(m.predicted_stretch, max_stretch)
+
+        sched_start = m.source_start + cumulative_drift
+        sched_end   = sched_start + m.source_duration_s + gap_shift
+
+        aligned.append(AlignedSegment(
+            index           = m.index,
+            original_start  = m.source_start,
+            original_end    = m.source_end,
+            scheduled_start = sched_start,
+            scheduled_end   = sched_end,
+            text            = m.translated_text,
+            action          = action,
+            gap_shift_s     = gap_shift,
+            stretch_factor  = stretch,
+        ))
+
+        cumulative_drift += gap_shift
+
+    return aligned
 
 def global_align_dp(
     metrics:         list[SegmentMetrics],

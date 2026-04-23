@@ -395,7 +395,7 @@ def _compute_speech_offset(source_path: str) -> float:
     return yt_start - whisper_start
 
 
-def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=None, speaker_wav_map=None):
+def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=None, speaker_wav_map=None, speaker_wav=None):
     """Read translated JSON with segment timestamps and produce a time-aligned WAV.
 
     Each segment is individually synthesized and time-stretched to match its
@@ -481,7 +481,7 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
     with tempfile.TemporaryDirectory() as synth_dir:
         def _do_synth(idx: int, text: str, speaker: str = "") -> tuple[int, bytes | None]:
             wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
-            ref_wav = (speaker_wav_map or {}).get(speaker, "")
+            ref_wav = (speaker_wav_map or {}).get(speaker, "") or speaker_wav or ""
             if ref_wav and hasattr(engine, "tts_to_file"):
                 try:
                     engine.tts_to_file(text=text, file_path=wav_path, speaker_wav=ref_wav)
