@@ -16,18 +16,32 @@ def resolve_speaker_wav(
     """Resolve the reference WAV path for voice cloning.
 
     Resolution order:
-    1. speakers/{lang}/{speaker_id}.wav  (if speaker_id given and file exists)
-    2. speakers/{lang}/default.wav       (language-specific default)
-    3. speakers/default.wav              (global fallback)
+    1. Speaker-specific: ``speakers/{lang}/{speaker_id}.wav``
+    2. Language default: ``speakers/{lang}/default.wav``
+    3. Global default:   ``speakers/default.wav``
 
     Args:
-        speakers_dir: Absolute path to the speakers directory.
-        target_language: Language code (e.g. "es", "fr").
-        speaker_id: Optional speaker identifier (e.g. "SPEAKER_00").
+        speakers_dir: Absolute path to the ``pipeline_data/speakers/`` directory.
+        target_language: ISO 639-1 language code (e.g. ``"es"``, ``"fr"``).
+        speaker_id: Optional speaker label (e.g. ``"SPEAKER_00"``).
+            If None, skips straight to language default.
 
     Returns:
-        Relative path string for the Chatterbox container (e.g. "es/default.wav").
+        Relative path string suitable for passing to ChatterboxClient
+        (relative to ``speakers_dir``).
     """
-    # ---- YOUR CODE HERE ----
-    raise NotImplementedError("Implement this function")
-    # ---- END YOUR CODE ----
+    lang_dir = speakers_dir / target_language
+
+    # 1. Speaker-specific WAV
+    if speaker_id:
+        speaker_wav = lang_dir / f"{speaker_id}.wav"
+        if speaker_wav.exists():
+            return f"{target_language}/{speaker_id}.wav"
+
+    # 2. Language default
+    lang_default = lang_dir / "default.wav"
+    if lang_default.exists():
+        return f"{target_language}/default.wav"
+
+    # 3. Global default
+    return "default.wav"
