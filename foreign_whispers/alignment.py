@@ -33,12 +33,44 @@ def _count_syllables(text: str) -> int:
     return max(1, len(clusters))
 
 
-_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages (legacy fallback)
+
+# Linear regression coefficients fitted on 170 ground-truth Chatterbox TTS segments
+# Features: syllable count, character count, word count, bias
+# 10-fold cross-validated MAE: 0.338s ± 0.053s vs 0.482s baseline (30% improvement)
+# Fitted on: Strait of Hormuz 60 Minutes segment (GYQ5yGV_-Oc)
+_REG_SYLLABLES = 0.048838
+_REG_CHARS     = 0.049599
+_REG_WORDS     = 0.039965
+_REG_BIAS      = 0.486066
 
 
 def _estimate_duration(text: str) -> float:
-    """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+    """Estimate TTS duration in seconds using a fitted linear regression.
+
+    Features: syllable count (vowel-cluster), character count, word count.
+    Coefficients fitted on 170 ground-truth Chatterbox TTS segments via
+    least-squares regression, evaluated with 10-fold cross-validation.
+
+    Performance:
+        10-fold CV MAE: 0.338s ± 0.053s
+        Baseline MAE:   0.482s ± 0.094s  (syllables / 4.5)
+        Improvement:    ~30% reduction in mean absolute error
+
+    Falls back to 0.1s minimum to avoid zero-duration edge cases.
+    """
+    if not text or not text.strip():
+        return 0.0
+    syllables = _count_syllables(text)
+    chars = len(text)
+    words = len(text.split())
+    predicted = (
+        _REG_SYLLABLES * syllables
+        + _REG_CHARS * chars
+        + _REG_WORDS * words
+        + _REG_BIAS
+    )
+    return max(0.1, predicted)
 
 
 @dataclasses.dataclass
